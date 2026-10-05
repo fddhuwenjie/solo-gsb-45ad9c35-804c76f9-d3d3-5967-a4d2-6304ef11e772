@@ -708,3 +708,46 @@ class AddressProvisionResponse(BaseModel):
         ...,
         description="True when a stored provision was returned instead of creating one",
     )
+
+
+# ---------------------------------------------------------------------------
+# Safe decommissioning: release an allocation and cut plans over atomically
+# ---------------------------------------------------------------------------
+
+
+class DecommissionRequest(BaseModel):
+    request_id: str = Field(
+        ..., min_length=1, description="request_id of the allocation to release"
+    )
+    active_plan_id: str = Field(
+        ...,
+        min_length=1,
+        description="The pool's single currently active BGP plan, to be retired",
+    )
+    new_plan_id: str = Field(
+        ...,
+        min_length=1,
+        description="Idempotency key of the successor plan created by this operation",
+    )
+    relationships: list[AsRelation] = Field(
+        default_factory=list,
+        description="AS relationships used to audit every successor announcement path",
+    )
+    announcements: list[BgpAnnouncement] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "Successor announcements covering every allocation remaining after "
+            "the release; they must not intersect the released CIDR"
+        ),
+    )
+
+
+class DecommissionResponse(BaseModel):
+    pool_id: int
+    released: str = Field(..., description="CIDR of the released allocation")
+    request_id: str
+    plans: list[BgpPlanResponse] = Field(
+        ...,
+        description="The retired active plan followed by the activated successor plan",
+    )

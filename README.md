@@ -37,6 +37,12 @@
   当前状态（`replayed: true`），不会重新占用已释放地址；即使该 `request_id` 之后被普通
   分配复用，旧开通仍按原记录重放
 - 一条命令启动，监听 **8000** 端口
+- 可对**仍有其他分配的地址池**做**安全退网**：请求指定待释放的 `request_id`、当前
+  活动计划 ID、接班计划 ID、AS 关系与接班公告，在**同一个 SQLite 写事务**内确认池只有
+  指定的活动计划且其固定的池状态仍与当前一致，释放目标分配后复用现有路径审计与计划覆盖
+  规则校验接班公告（不得与释放的 CIDR 相交、覆盖全部剩余分配、每项单一起源），通过后
+  保存固定退网后池状态的接班计划、退役旧计划并激活接班计划；计划 ID 冲突、状态变化或
+  公告不合格时分配与计划都不会部分改变
 
 ## 快速开始
 
@@ -78,6 +84,7 @@ SUBNET_DB_PATH=./subnets.db .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port
 | `POST` | `/pools/{id}/renumber` | 整体改址：池整体平移到同前缀长度的新 CIDR，排除网段与分配按偏移一起平移（单写事务） |
 | `POST` | `/pools/{id}/allocations` | 按前缀长度申请子网（需带 `request_id`） |
 | `POST` | `/pools/{id}/provisions` | 一次性开通：单写事务内分配子网并创建配套 planned BGP 计划（`plan_id` 幂等） |
+| `POST` | `/pools/{id}/decommission` | 安全退网：单写事务内释放指定分配并把活动 BGP 计划原子交接给接班计划（旧计划退役、接班计划激活） |
 | `POST` | `/pools/{id}/reservations` | 按策略批量预留子网：单写事务、整批回滚（`batch_id` 幂等） |
 | `DELETE` | `/pools/{id}/allocations/{request_id}` | 释放子网 |
 | `POST` | `/pools/{id}/reverse-dns-plan` | 为当前分配生成 RFC 2317 反向 DNS 委派（只读） |
@@ -1288,6 +1295,174 @@ curl -s http://localhost:8000/pools/1
 会重新执行迁移，不会留下只迁了一半的表；迁移成功后再次 `docker compose restart`
 不会重复迁移、也不会丢失任何计划或开通记录。
 
+### 18. 安全退网（释放分配 + 计划原子交接，单写事务）
+
+`POST /pools/{id}/decommission` 用于地址池**仍有其他分配在用**时，把一个已分配子网
+安全退网：释放该分配的同时，把池当前的活动 BGP 公告计划原子替换为一份只覆盖剩余
+分配的接班计划。调用方在同一请求体中给出：
+
+- `request_id`：待释放的当前分配；
+- `active_plan_id`：池当前**唯一**的活动计划（旧计划，退网后被退役）；
+- `new_plan_id`：本次创建的接班计划 ID（不可与既有计划冲突）；
+- `relationships`：AS 关系，格式与 `/bgp/announcements/audit`、`/bgp-plans` 完全一致；
+- `announcements`：**接班公告**，覆盖释放后的全部剩余分配；前缀必须显式给出。
+
+服务在**同一个 `BEGIN IMMEDIATE` 写事务**内依次完成：
+
+1. **计划归属与活动集合确认**：`active_plan_id` 必须存在且属于该池（不存在或错池
+   返回 `404 bgp_plan_not_found`）；池当前活动计划集合必须**恰好**是
+   `{active_plan_id}` 这一份——计划处于 `planned`/`retired`、池内有多个活动计划
+   （旧库遗留）都返回 `409 bgp_handover_set_mismatch`，后者应先走普通交接端点；
+2. **接班计划 ID 冲突**：`new_plan_id` 已被任何既有 BGP 计划（单独创建、开通或
+   上一次退网产生）占用时返回 `409 bgp_plan_id_conflict`；`new_plan_id` 等于
+   `active_plan_id` 是请求形状错误（`422 bgp_decommission_invalid`）；
+3. **目标分配确认**：`request_id` 必须是该池的现存分配，否则
+   `404 allocation_not_found`；且释放后**必须仍有其他分配**——这是"仍有其他分配的
+   地址池"的安全退网，退掉最后一个分配返回
+   `422 decommission_no_remaining_allocations`；
+4. **固定的池状态一致性**：活动计划创建/激活时固定的 `state_digest` 必须仍与当前
+   池状态完全一致，且其已存审计结果仍满足覆盖与单一起源；池在此期间发生任何变化
+   （新增/释放分配、追加排除网段，即使同 CIDR 同 request_id 重新分配也算变化）返回
+   `409 bgp_plan_state_conflict`；
+5. **释放目标分配**，随后在同一事务内用**现有无状态路径审计**与**现有计划覆盖规则**
+   校验接班公告：
+   - 关系冲突、未知关系边、非法前缀、空 AS_PATH、公告 id 重复等请求级错误照旧 422；
+   - 每条公告前缀必须完全位于池内（`bgp_announcement_outside_pool`）、不碰排除网段
+     （`bgp_announcement_overlaps_exclusion`）；
+   - **接班公告不得与释放的 CIDR 相交**（`bgp_announcement_overlaps_released`，422）：
+     无论审计状态如何，任何公告前缀与被释放网段重叠（相等、包含、被包含、部分重叠）
+     都被拒绝，确保退网网段立即停止公告；
+   - **每个剩余分配**必须至少被一条 `status: "valid"` 的公告覆盖
+     （`bgp_allocation_uncovered`），且同一剩余分配只允许**单一起源**
+     （`bgp_allocation_origin_conflict`）。
+
+全部通过后，在同一事务内：写入固定**退网后**池状态摘要的接班计划（创建即
+`active`，记录 `activated_at`），把旧计划置为 `retired`，然后提交。任一步失败——
+计划 ID 冲突、池状态变化、目标分配缺失、公告审计或覆盖不合格——事务整体回滚，
+**目标分配不会被释放，任何计划状态也不会部分改变**。
+
+```bash
+# 池 203.0.113.0/24 下已有两个 /25：order-1（.0/25）与 order-2（.128/25），
+# 活动计划 release-1 用一条 /24 公告同时覆盖二者。
+curl -s -X POST http://localhost:8000/pools/1/decommission \
+  -H 'Content-Type: application/json' -d '{
+    "request_id": "order-2",
+    "active_plan_id": "release-1",
+    "new_plan_id": "release-2",
+    "relationships": [
+      {"type": "customer_provider", "customer": 10, "provider": 100}
+    ],
+    "announcements": [
+      {"id": "keep", "prefix": "203.0.113.0/25", "as_path": [10, 100]}
+    ]
+  }'
+```
+
+```json
+{
+  "pool_id": 1,
+  "released": "203.0.113.128/25",
+  "request_id": "order-2",
+  "plans": [
+    {"plan_id": "release-1", "pool_id": 1, "status": "retired",
+     "results": ["...旧计划创建时保存的审计结果..."],
+     "state_digest": "8f2c...e1",
+     "pool_state": {"cidr": "203.0.113.0/24", "exclusions": [],
+                    "allocations": ["203.0.113.0/25", "203.0.113.128/25"]},
+     "created_at": "2026-10-04T09:00:00+00:00",
+     "activated_at": "2026-10-04T10:00:00+00:00"},
+    {"plan_id": "release-2", "pool_id": 1, "status": "active",
+     "results": [
+       {"id": "keep", "prefix": "203.0.113.0/25", "as_path": [10, 100],
+        "origin": 100, "status": "valid", "flags": [], "violating_hop": null}
+     ],
+     "state_digest": "4b7a...92",
+     "pool_state": {"cidr": "203.0.113.0/24", "exclusions": [],
+                    "allocations": ["203.0.113.0/25"]},
+     "created_at": "2026-10-05T08:00:00+00:00",
+     "activated_at": "2026-10-05T08:00:00+00:00"}
+  ]
+}
+```
+
+响应给出**释放的 CIDR** 与两份计划状态：`plans` 固定为 `[旧计划（retired）,
+接班计划（active）]`；接班计划的 `pool_state`/`state_digest` 固定的是**退网后**
+状态（只含剩余分配），可直接与 `GET /pools/{id}/snapshot` 的实算摘要复验。
+
+**失败与幂等语义**：
+
+- 操作**不可重放**（与交接一致）：提交成功后，旧计划已退役、接班计划已激活、目标
+  分配已删除；原样重试会先看到活动集合不再是 `{active_plan_id}` 而返回
+  `409 bgp_handover_set_mismatch`（或目标分配已不存在的
+  `404 allocation_not_found`），不会二次释放或重复建计划；
+- 计划 ID 冲突、池状态过期、公告不合格等任一失败都在提交前发生，**分配与计划均
+  保持原样**，`new_plan_id` 也不被占用，修正请求后可原样重试；
+- 退网产生的接班计划就是一条普通 `bgp_plans` 记录，之后仍可被单独重复激活
+  （幂等）或参与普通交接；被退役的旧计划同样是终态，不能再激活；
+- **开通历史保留**：退网只删除普通分配行，`address_provisions` 开通记录与其计划
+  原样保留。若释放的正是某次开通的分配，用相同 `plan_id` + 相同参数重试开通仍
+  返回历史分配（旧行 id 与原 CIDR）、原公告与计划**当前 `retired` 状态**
+  （`replayed: true`），**不会重新占用**已释放地址；
+- 原有分配、释放、计划创建/激活/交接接口全部继续可用，行为不变。并发退网由
+  `BEGIN IMMEDIATE` 串行化：恰好一个成功，其余看到已提交的状态而冲突，绝不出现
+  分配已删但计划未交接的中间态。
+
+**完整可执行示例**（空库起步，可直接复制运行）：
+
+```bash
+# 1) 建池并分配两个 /25
+curl -s -X POST http://localhost:8000/pools \
+  -H 'Content-Type: application/json' \
+  -d '{"cidr": "203.0.113.0/24", "exclusions": []}'
+
+curl -s -X POST http://localhost:8000/pools/1/allocations \
+  -H 'Content-Type: application/json' \
+  -d '{"request_id": "order-1", "prefix_length": 25}'
+curl -s -X POST http://localhost:8000/pools/1/allocations \
+  -H 'Content-Type: application/json' \
+  -d '{"request_id": "order-2", "prefix_length": 25}'
+
+# 2) 创建并激活活动计划：一条 /24 公告覆盖两个 /25
+curl -s -X POST http://localhost:8000/pools/1/bgp-plans \
+  -H 'Content-Type: application/json' -d '{
+    "plan_id": "release-1",
+    "relationships": [{"type": "customer_provider", "customer": 10, "provider": 100}],
+    "announcements": [
+      {"id": "all", "prefix": "203.0.113.0/24", "as_path": [10, 100]}
+    ]
+  }'
+curl -s -X POST http://localhost:8000/pools/1/bgp-plans/release-1/activate
+
+# 3) 退网 order-2：接班公告只覆盖剩余的 203.0.113.0/25
+curl -s -X POST http://localhost:8000/pools/1/decommission \
+  -H 'Content-Type: application/json' -d '{
+    "request_id": "order-2",
+    "active_plan_id": "release-1",
+    "new_plan_id": "release-2",
+    "relationships": [{"type": "customer_provider", "customer": 10, "provider": 100}],
+    "announcements": [
+      {"id": "keep", "prefix": "203.0.113.0/25", "as_path": [10, 100]}
+    ]
+  }'
+
+# 4) 池状态：只剩 order-1，203.0.113.128/25 回到空闲列表
+curl -s http://localhost:8000/pools/1
+
+# 5) 接班公告若仍覆盖已释放网段 -> 422 bgp_announcement_overlaps_released，
+#    分配与计划均不变
+curl -s -X POST http://localhost:8000/pools/1/decommission \
+  -H 'Content-Type: application/json' -d '{
+    "request_id": "order-1",
+    "active_plan_id": "release-2",
+    "new_plan_id": "release-3",
+    "relationships": [{"type": "customer_provider", "customer": 10, "provider": 100}],
+    "announcements": [
+      {"id": "all", "prefix": "203.0.113.0/24", "as_path": [10, 100]}
+    ]
+  }'
+# {"error":{"code":"bgp_announcement_overlaps_released", ...}}
+```
+
 ## 错误响应
 
 统一格式：
@@ -1359,11 +1534,15 @@ curl -s http://localhost:8000/pools/1
 | 409 | `bgp_plan_retired` | 重新激活已被交接退役的计划（退役为终态） |
 | 409 | `bgp_plan_handover_required` | 池已有 active 计划，另一份 planned 计划须走交接端点替换 |
 | 409 | `bgp_plan_not_planned` | 交接的接班计划不是 `planned`（已 active 或已 retired） |
-| 409 | `bgp_handover_set_mismatch` | 交接清单与池当前 active 计划集合不完全一致 |
+| 409 | `bgp_handover_set_mismatch` | 交接清单与池当前 active 计划集合不完全一致；或安全退网的 `active_plan_id` 不是池的唯一活动计划 |
 | 422 | `bgp_handover_invalid` | 交接请求形状非法：清单重复或接班计划同时列入旧清单 |
 | 409 | `batch_id_conflict` | 同一 `batch_id` 以不同参数（池、规则或预留项）重放 |
 | 409 | `reservation_denied` | 批内某项选中的最小空闲网段未完全落在 allow 段内（整批回滚） |
 | 409 | `provision_id_conflict` | 一次性开通的 `plan_id` 曾以不同参数（池、request_id、prefix_length、关系或公告）提交 |
+| 409 | `bgp_plan_id_conflict` | 安全退网的接班 `new_plan_id` 已被既有 BGP 计划占用 |
+| 422 | `bgp_decommission_invalid` | 安全退网请求形状非法：接班计划 ID 与活动计划 ID 相同 |
+| 422 | `decommission_no_remaining_allocations` | 目标分配是池内唯一分配；安全退网要求释放后仍有其他分配 |
+| 422 | `bgp_announcement_overlaps_released` | 接班公告前缀与退网释放的 CIDR 相交 |
 | 422 | `bgp_announcement_outside_pool` | 公告前缀不完全位于地址池内 |
 | 422 | `bgp_announcement_overlaps_exclusion` | 公告前缀与池的排除网段重叠 |
 | 422 | `bgp_allocation_uncovered` | 存在当前分配未被任何审计通过的公告覆盖 |
@@ -1430,6 +1609,14 @@ curl -s http://localhost:8000/pools/1
   才随级联移除。旧库升级时 `address_provisions` 与 `bgp_plans` 在同一个协调事务内
   一起重建以解除该级联（见上一条"旧库结构升级"），未释放的开通记录按 `plan_id`
   原样保留、升级后仍可重试，按 request_id 的查询索引同步重建。
+- **安全退网**的全部工作（活动计划归属与活动集合确认、接班计划 ID 冲突检查、目标
+  分配与"仍有剩余分配"校验、旧计划固定摘要一致性复核、释放目标分配、接班公告的
+  路径审计/池内/排除/释放网段相交/覆盖/单一起源校验、接班计划写入、旧计划退役）
+  都在单个 `BEGIN IMMEDIATE` 写事务内完成：并发退网与其他写操作被串行化，恰好一个
+  成功，其余看到提交后的状态而冲突；任一项失败整体回滚，**目标分配不被释放、计划
+  状态绝不部分改变、接班计划 ID 也不被占用**。`DELETE allocations` 不触发任何级联，
+  `address_provisions` 开通记录原样保留，释放的开通仍可按 `plan_id` 重放历史结果而
+  不重新占用地址。
 - 数据库开启 WAL 模式，读状态不会阻塞写分配。
 
 ## 项目结构
@@ -1444,6 +1631,7 @@ curl -s http://localhost:8000/pools/1
 │   ├── renumber.py    # 地址池整体改址：单写事务按池起点偏移平移排除网段与分配，保留行身份
 │   ├── reserve.py     # 按策略批量预留：单写事务编译规则+一致快照+按序选取，batch_id 幂等
 │   ├── provision.py   # 一次性开通：单写事务选址+补全公告+审计覆盖校验，同时写普通分配与 planned 计划，plan_id 幂等
+│   ├── decommission.py # 安全退网：单写事务释放分配并复用路径审计/覆盖规则校验接班公告，保存接班计划并退役旧计划
 │   ├── db.py          # SQLite 连接、建表、事务管理
 │   ├── cidrmath.py    # CIDR 集合运算：差集、合并、最低对齐选取、委派片段拆分
 │   ├── cidrpolicy.py  # CIDR 策略编译：首条匹配规则 -> 不重叠动作分段（仅同级同动作合并）

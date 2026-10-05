@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
-from . import bgpplan, migration, partition, provision, renumber, reserve, service, snapshot
+from . import bgpplan, decommission, migration, partition, provision, renumber, reserve, service, snapshot
 from .db import init_db
 from .schemas import (
     AllocateRequest,
@@ -31,6 +31,8 @@ from .schemas import (
     BgpPlanResponse,
     CidrPolicyCompileRequest,
     CidrPolicyCompileResponse,
+    DecommissionRequest,
+    DecommissionResponse,
     ExclusionCreateRequest,
     ExclusionResponse,
     PartitionRequest,
@@ -57,7 +59,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="IPv4 Subnet Allocation API",
-    version="1.9.0",
+    version="1.10.0",
     description=(
         "Allocate non-overlapping, aligned IPv4 subnets from address pools, "
         "reserve policy-gated batches of subnets atomically, "
@@ -69,8 +71,10 @@ app = FastAPI(
         "statelessly audit BGP announcements against AS relationships, "
         "record confirmable BGP announcement plans pinned to pool state, "
         "hand a pool's active plans over to a planned successor atomically, "
-        "and provision one subnet together with its BGP plan in a single "
-        "atomic submission."
+        "provision one subnet together with its BGP plan in a single "
+        "atomic submission, and decommission one allocated subnet while "
+        "keeping the pool's other allocations in service, cutting its "
+        "active BGP plan over to a successor in the same transaction."
     ),
     lifespan=lifespan,
 )
@@ -240,6 +244,23 @@ def provision_address(pool_id: int, body: AddressProvisionRequest, response: Res
     # 201 for a newly committed provision, 200 for an idempotent replay.
     response.status_code = 200 if result["replayed"] else 201
     return AddressProvisionResponse(**result)
+
+
+@app.post(
+    "/pools/{pool_id}/decommission",
+    response_model=DecommissionResponse,
+    tags=["provisioning"],
+)
+def decommission_address(pool_id: int, body: DecommissionRequest) -> DecommissionResponse:
+    result = decommission.decommission(
+        pool_id,
+        body.request_id,
+        body.active_plan_id,
+        body.new_plan_id,
+        body.relationships,
+        body.announcements,
+    )
+    return DecommissionResponse(**result)
 
 
 @app.delete(
