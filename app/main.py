@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
-from . import bgpplan, migration, partition, provision, renumber, reserve, service, snapshot
+from . import bgpplan, decommission, migration, partition, provision, renumber, reserve, service, snapshot
 from .db import init_db
 from .schemas import (
     AllocateRequest,
@@ -31,6 +31,8 @@ from .schemas import (
     BgpPlanResponse,
     CidrPolicyCompileRequest,
     CidrPolicyCompileResponse,
+    DecommissionRequest,
+    DecommissionResponse,
     ExclusionCreateRequest,
     ExclusionResponse,
     PartitionRequest,
@@ -57,7 +59,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="IPv4 Subnet Allocation API",
-    version="1.9.0",
+    version="1.10.0",
     description=(
         "Allocate non-overlapping, aligned IPv4 subnets from address pools, "
         "reserve policy-gated batches of subnets atomically, "
@@ -69,8 +71,10 @@ app = FastAPI(
         "statelessly audit BGP announcements against AS relationships, "
         "record confirmable BGP announcement plans pinned to pool state, "
         "hand a pool's active plans over to a planned successor atomically, "
-        "and provision one subnet together with its BGP plan in a single "
-        "atomic submission."
+        "provision one subnet together with its BGP plan in a single "
+        "atomic submission, "
+        "and decommission one allocation while swapping the pool's active "
+        "plan for a freshly stored successor in a single write transaction."
     ),
     lifespan=lifespan,
 )
@@ -142,6 +146,23 @@ def activate_bgp_plan(pool_id: int, plan_id: str) -> BgpPlanResponse:
 def handover_bgp_plans(pool_id: int, body: BgpPlanHandoverRequest) -> BgpPlanHandoverResponse:
     result = bgpplan.handover_bgp_plans(pool_id, body.old_plan_ids, body.new_plan_id)
     return BgpPlanHandoverResponse(**result)
+
+
+@app.post(
+    "/pools/{pool_id}/decommissions",
+    response_model=DecommissionResponse,
+    tags=["decommissioning"],
+)
+def decommission_allocation(pool_id: int, body: DecommissionRequest) -> DecommissionResponse:
+    result = decommission.decommission_allocation(
+        pool_id,
+        body.request_id,
+        body.active_plan_id,
+        body.plan_id,
+        body.relationships,
+        body.announcements,
+    )
+    return DecommissionResponse(**result)
 
 
 @app.post("/pools", response_model=PoolResponse, status_code=201, tags=["pools"])

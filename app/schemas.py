@@ -708,3 +708,51 @@ class AddressProvisionResponse(BaseModel):
         ...,
         description="True when a stored provision was returned instead of creating one",
     )
+
+
+# ---------------------------------------------------------------------------
+# Safe decommissioning of one allocation with an atomic plan swap
+# ---------------------------------------------------------------------------
+
+
+class DecommissionRequest(BaseModel):
+    request_id: str = Field(
+        ...,
+        min_length=1,
+        description="request_id of the allocation to release",
+    )
+    active_plan_id: str = Field(
+        ...,
+        min_length=1,
+        description="Id of the pool's only currently active plan, to be retired",
+    )
+    plan_id: str = Field(
+        ...,
+        min_length=1,
+        description="Client-generated idempotency key for the successor plan",
+    )
+    relationships: list[AsRelation] = Field(
+        default_factory=list,
+        description="AS relationships used to audit every announcement path",
+    )
+    announcements: list[BgpAnnouncement] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "Successor announcements covering every remaining allocation "
+            "after the release; none may intersect the released CIDR"
+        ),
+    )
+
+
+class DecommissionResponse(BaseModel):
+    pool_id: int
+    released: str = Field(..., description="CIDR freed by the decommission")
+    request_id: str = Field(..., description="request_id of the released allocation")
+    plans: list[BgpPlanResponse] = Field(
+        ...,
+        description=(
+            "The retired outgoing plan first, then the successor plan "
+            "stored already active and pinned to the post-release pool state"
+        ),
+    )
